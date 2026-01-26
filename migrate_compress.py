@@ -1,0 +1,557 @@
+#!/usr/bin/env python3
+"""
+Migration script: Copy directories to scratch, compress on the fly, with extensive logging.
+
+Workflow:
+1. Enumerate subdirectories in source
+2. For each directory: rsync to scratch destination
+3. Compress matching files in destination
+4. Log all operations with checksums for verification
+5. Support resumption if interrupted
+
+Usage:
+python migrate_compress.py --source /data/original --dest /scratch/migration --ext tsv clusters cluster --dry-run
+python migrate_compress.py --source /data/original --dest /scratch/migration --ext tsv clusters cluster --pigz --resume
+"""
+from __future__ import annotations
+
+import argparse
+import datetime
+import gzip
+import hashlib
+import json
+import logging
+import lzma
+import multiprocessing
+import os
+import shutil
+import subprocess
+import sys
+import time
+from dataclasses import dataclass, field, asdict
+from functools import partial
+from pathlib import Path
+from typing import List, Optional, Dict, Any
+
+CHUNK = 1024 * 1024  # 1MB buffer
+
+# Configure logging
+def setup_logging(log_file: Path) -> logging.Logger:
+    """Setup logging to both console and file."""
+    logger = logging.getLogger('migrate_compress')
+    logger.setLevel(logging.DEBUG)
+
+    # Console handler (INFO level)
+    console = logging.StreamHandler()
+    console.setLevel(logging.INFO)
+    console.setFormatter(logging.Formatter('%(asctime)s %(levelname)s: %(message)s'))
+    logger.addHandler(console)
+
+    # File handler (DEBUG level for detailed logs)
+    file_handler = logging.FileHandler(log_file, mode='a')
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s: %(message)s'))
+    logger.addHandler(file_handler)
+
+    return logger
+
+
+@dataclass
+class FileRecord:
+    """Record of a single file operation."""
+    source_path: str
+    dest_path: str
+    original_size: int
+    compressed_size: Optional[int] = None
+    source_sha256: Optional[str] = None
+    compressed_sha256: Optional[str] = None
+    decompressed_sha256: Optional[str] = None
+    status: str = 'pending'  # pending, copied, compressed, verified, error
+    error_message: Optional[str] = None
+    rsync_exit_code: Optional[int] = None
+    timestamp: str = field(default_factory=lambda: datetime.datetime.now().isoformat())
+
+
+@dataclass
+class DirectoryRecord:
+    """Record of a directory migration."""
+    source_dir: str
+    dest_dir: str
+    status: str = 'pending'  # pending, syncing, compressing, completed, error
+    rsync_command: Optional[str] = None
+    rsync_exit_code: Optional[int] = None
+    files: List[FileRecord] = field(default_factory=list)
+    total_source_size: int = 0
+    total_compressed_size: int = 0
+    start_time: Optional[str] = None
+    end_time: Optional[str] = None
+    error_message: Optional[str] = None
+
+
+class MigrationLog:
+    """JSON-based migration log for tracking and resumption."""
+
+    def __init__(self, log_path: Path):
+        self.log_path = log_path
+        self.directories: Dict[str, DirectoryRecord] = {}
+        self._load()
+
+    def _load(self):
+        """Load existing log if present."""
+        if self.log_path.exists():
+            with open(self.log_path, 'r') as f:
+                data = json.load(f)
+                for dir_path, dir_data in data.get('directories', {}).items():
+                    files = [FileRecord(**fr) for fr in dir_data.pop('files', [])]
+                    self.directories[dir_path] = DirectoryRecord(**dir_data, files=files)
+
+    def save(self):
+        """Save log to disk."""
+        data = {
+            'last_updated': datetime.datetime.now().isoformat(),
+            'directories': {k: asdict(v) for k, v in self.directories.items()}
+        }
+        # Write to temp file first, then rename for atomicity
+        tmp_path = self.log_path.with_suffix('.tmp')
+        with open(tmp_path, 'w') as f:
+            json.dump(data, f, indent=2)
+        tmp_path.replace(self.log_path)
+
+    def get_or_create_dir(self, source_dir: str, dest_dir: str) -> DirectoryRecord:
+        """Get existing record or create new one."""
+        if source_dir not in self.directories:
+            self.directories[source_dir] = DirectoryRecord(
+                source_dir=source_dir,
+                dest_dir=dest_dir
+            )
+        return self.directories[source_dir]
+
+    def is_completed(self, source_dir: str) -> bool:
+        """Check if directory was already successfully processed."""
+        if source_dir in self.directories:
+            return self.directories[source_dir].status == 'completed'
+        return False
+
+
+def sha256_of_file(path: Path) -> str:
+    """Calculate SHA256 hash of a file."""
+    h = hashlib.sha256()
+    with path.open('rb') as f:
+        while True:
+            chunk = f.read(CHUNK)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def get_size_str(size_bytes: int) -> str:
+    """Convert bytes to human-readable string."""
+    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+        if size_bytes < 1024:
+            return f"{size_bytes:.2f} {unit}"
+        size_bytes /= 1024
+    return f"{size_bytes:.2f} PB"
+
+
+def rsync_directory(source: Path, dest: Path, logger: logging.Logger, dry_run: bool = False) -> tuple[int, str]:
+    """
+    Rsync a directory with resumable options.
+
+    Returns (exit_code, command_string)
+    """
+    # Ensure destination parent exists
+    dest.parent.mkdir(parents=True, exist_ok=True)
+
+    cmd = [
+        'rsync',
+        '-av',              # archive mode, verbose
+        '--partial',        # keep partially transferred files for resume
+        '--progress',       # show progress
+        '--checksum',       # use checksum to verify transfers
+        '--human-readable',
+        str(source) + '/',  # trailing slash = contents of source
+        str(dest) + '/'
+    ]
+
+    if dry_run:
+        cmd.insert(1, '--dry-run')
+
+    cmd_str = ' '.join(cmd)
+    logger.info(f"Running: {cmd_str}")
+
+    result = subprocess.run(cmd, capture_output=False)
+    return result.returncode, cmd_str
+
+
+def compress_file_worker(
+    args: tuple[Path, Path, str, int, bool, int, bool]
+) -> FileRecord:
+    """
+    Worker function to compress a single file.
+
+    Args tuple: (source_in_dest, final_path, algo, level, use_pigz, pigz_threads, verify)
+    """
+    source_in_dest, final_path, algo, level, use_pigz, pigz_threads, verify = args
+
+    record = FileRecord(
+        source_path=str(source_in_dest),
+        dest_path=str(final_path),
+        original_size=source_in_dest.stat().st_size
+    )
+
+    try:
+        # Calculate source hash if verifying
+        if verify:
+            record.source_sha256 = sha256_of_file(source_in_dest)
+
+        # Determine output path
+        if algo == 'gzip':
+            out_suffix = '.gz'
+        elif algo == 'xz':
+            out_suffix = '.xz'
+        else:
+            raise ValueError(f'Unsupported algorithm: {algo}')
+
+        compressed_path = source_in_dest.with_name(source_in_dest.name + out_suffix)
+        tmp_path = compressed_path.with_suffix(compressed_path.suffix + '.tmp')
+
+        # Skip if already compressed
+        if compressed_path.exists():
+            record.status = 'skipped'
+            record.dest_path = str(compressed_path)
+            record.compressed_size = compressed_path.stat().st_size
+            return record
+
+        # Compress
+        if algo == 'gzip':
+            if use_pigz:
+                with tmp_path.open('wb') as f_out:
+                    subprocess.run(
+                        ['pigz', '-c', f'-p{pigz_threads}', f'-{level}', str(source_in_dest)],
+                        stdout=f_out,
+                        check=True
+                    )
+            else:
+                with source_in_dest.open('rb') as f_in:
+                    with gzip.open(tmp_path, 'wb', compresslevel=level) as gz:
+                        shutil.copyfileobj(f_in, gz, CHUNK)
+        else:  # xz
+            with source_in_dest.open('rb') as f_in:
+                with lzma.open(tmp_path, 'wb', preset=level) as xz:
+                    shutil.copyfileobj(f_in, xz, CHUNK)
+
+        # Atomic rename
+        tmp_path.replace(compressed_path)
+        record.compressed_size = compressed_path.stat().st_size
+        record.dest_path = str(compressed_path)
+        record.status = 'compressed'
+
+        # Verify by decompressing and hashing
+        if verify:
+            h = hashlib.sha256()
+            open_func = gzip.open if algo == 'gzip' else lzma.open
+            with open_func(compressed_path, 'rb') as f:
+                while True:
+                    chunk = f.read(CHUNK)
+                    if not chunk:
+                        break
+                    h.update(chunk)
+            record.decompressed_sha256 = h.hexdigest()
+
+            if record.decompressed_sha256 != record.source_sha256:
+                record.status = 'error'
+                record.error_message = 'Verification failed: hash mismatch'
+                compressed_path.unlink(missing_ok=True)
+                return record
+
+            record.status = 'verified'
+
+        # Remove uncompressed copy in dest (keep compressed version)
+        source_in_dest.unlink()
+
+    except Exception as e:
+        record.status = 'error'
+        record.error_message = str(e)
+
+    return record
+
+
+def find_compressible_files(directory: Path, extensions: List[str]) -> List[Path]:
+    """Find all files with matching extensions in directory."""
+    normalized = {e.lower().lstrip('.') for e in extensions}
+    files = []
+    for p in directory.rglob('*'):
+        if p.is_file():
+            suffix = p.suffix.lower().lstrip('.')
+            if suffix in normalized:
+                files.append(p)
+    return files
+
+
+def process_directory(
+    source_dir: Path,
+    dest_dir: Path,
+    extensions: List[str],
+    algo: str,
+    level: int,
+    use_pigz: bool,
+    pigz_threads: int,
+    workers: int,
+    verify: bool,
+    dry_run: bool,
+    logger: logging.Logger,
+    migration_log: MigrationLog
+) -> DirectoryRecord:
+    """Process a single directory: rsync then compress."""
+
+    record = migration_log.get_or_create_dir(str(source_dir), str(dest_dir))
+    record.start_time = datetime.datetime.now().isoformat()
+
+    logger.info(f"{'[DRY RUN] ' if dry_run else ''}Processing directory: {source_dir}")
+
+    # Step 1: Rsync
+    record.status = 'syncing'
+    migration_log.save()
+
+    exit_code, cmd_str = rsync_directory(source_dir, dest_dir, logger, dry_run)
+    record.rsync_command = cmd_str
+    record.rsync_exit_code = exit_code
+
+    if exit_code != 0:
+        record.status = 'error'
+        record.error_message = f'rsync failed with exit code {exit_code}'
+        record.end_time = datetime.datetime.now().isoformat()
+        migration_log.save()
+        logger.error(f"rsync failed for {source_dir}: exit code {exit_code}")
+        return record
+
+    if dry_run:
+        record.status = 'dry_run'
+        record.end_time = datetime.datetime.now().isoformat()
+        migration_log.save()
+        return record
+
+    # Step 2: Find and compress files
+    record.status = 'compressing'
+    migration_log.save()
+
+    files_to_compress = find_compressible_files(dest_dir, extensions)
+    logger.info(f"Found {len(files_to_compress)} files to compress in {dest_dir}")
+
+    if not files_to_compress:
+        record.status = 'completed'
+        record.end_time = datetime.datetime.now().isoformat()
+        migration_log.save()
+        return record
+
+    # Prepare worker arguments
+    work_items = [
+        (f, f, algo, level, use_pigz, pigz_threads, verify)
+        for f in files_to_compress
+    ]
+
+    # Process files in parallel
+    record.files = []
+    record.total_source_size = 0
+    record.total_compressed_size = 0
+
+    with multiprocessing.Pool(processes=workers) as pool:
+        for file_record in pool.imap_unordered(compress_file_worker, work_items):
+            record.files.append(file_record)
+            record.total_source_size += file_record.original_size
+            if file_record.compressed_size:
+                record.total_compressed_size += file_record.compressed_size
+
+            if file_record.status in ('compressed', 'verified'):
+                ratio = (1 - file_record.compressed_size / file_record.original_size) * 100 if file_record.original_size > 0 else 0
+                logger.info(f"OK {file_record.source_path} -> {get_size_str(file_record.compressed_size)} ({ratio:.1f}% reduction)")
+            elif file_record.status == 'skipped':
+                logger.debug(f"SKIP {file_record.source_path} (already compressed)")
+            else:
+                logger.error(f"ERROR {file_record.source_path}: {file_record.error_message}")
+
+            # Save progress periodically
+            migration_log.save()
+
+    # Check for errors
+    errors = [f for f in record.files if f.status == 'error']
+    if errors:
+        record.status = 'completed_with_errors'
+        record.error_message = f'{len(errors)} files failed'
+    else:
+        record.status = 'completed'
+
+    record.end_time = datetime.datetime.now().isoformat()
+    migration_log.save()
+
+    # Summary
+    if record.total_source_size > 0:
+        ratio = (1 - record.total_compressed_size / record.total_source_size) * 100
+        logger.info(
+            f"Directory complete: {get_size_str(record.total_source_size)} -> "
+            f"{get_size_str(record.total_compressed_size)} ({ratio:.1f}% reduction)"
+        )
+
+    return record
+
+
+def get_subdirectories(root: Path, max_depth: int = 1) -> List[Path]:
+    """Get immediate subdirectories of root."""
+    if max_depth == 0:
+        return [root]
+
+    subdirs = []
+    for p in root.iterdir():
+        if p.is_dir():
+            subdirs.append(p)
+
+    # Sort for consistent ordering
+    return sorted(subdirs)
+
+
+def main(argv: List[str]) -> int:
+    parser = argparse.ArgumentParser(
+        description='Migrate and compress data directory by directory',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Dry run to see what would happen
+  python migrate_compress.py --source /data/original --dest /scratch/migration --dry-run
+
+  # Full migration with pigz compression and verification
+  python migrate_compress.py --source /data/original --dest /scratch/migration --pigz --verify
+
+  # Resume interrupted migration
+  python migrate_compress.py --source /data/original --dest /scratch/migration --pigz --resume
+        """
+    )
+
+    parser.add_argument('--source', '-s', type=Path, required=True,
+                        help='Source root directory')
+    parser.add_argument('--dest', '-d', type=Path, required=True,
+                        help='Destination root directory (scratch)')
+    parser.add_argument('--ext', nargs='+', default=['tsv', 'clusters', 'cluster'],
+                        help='File extensions to compress (default: tsv clusters cluster)')
+    parser.add_argument('--algo', choices=['gzip', 'xz'], default='gzip',
+                        help='Compression algorithm (default: gzip)')
+    parser.add_argument('--level', type=int, default=6,
+                        help='Compression level 1-9 (default: 6)')
+    parser.add_argument('--pigz', action='store_true',
+                        help='Use pigz for faster gzip compression')
+    parser.add_argument('--pigz-threads', type=int, default=4,
+                        help='Threads per pigz process (default: 4)')
+    parser.add_argument('--workers', type=int, default=max(1, multiprocessing.cpu_count() // 2),
+                        help='Parallel compression workers (default: half of CPU count)')
+    parser.add_argument('--verify', action='store_true',
+                        help='Verify compressed files by decompressing and comparing hashes')
+    parser.add_argument('--dry-run', action='store_true',
+                        help='Show what would be done without making changes')
+    parser.add_argument('--resume', action='store_true',
+                        help='Resume from previous run, skipping completed directories')
+    parser.add_argument('--log-dir', type=Path, default=None,
+                        help='Directory for log files (default: dest directory)')
+    parser.add_argument('--process-root', action='store_true',
+                        help='Process source as single directory instead of iterating subdirs')
+
+    args = parser.parse_args(argv)
+
+    # Validate paths
+    if not args.source.exists():
+        print(f"Error: Source path does not exist: {args.source}", file=sys.stderr)
+        return 1
+
+    # Setup logging
+    log_dir = args.log_dir or args.dest
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+    log_file = log_dir / f'migration_{timestamp}.log'
+    json_log_file = log_dir / 'migration_state.json'
+
+    logger = setup_logging(log_file)
+    logger.info(f"Migration started: {args.source} -> {args.dest}")
+    logger.info(f"Extensions to compress: {args.ext}")
+    logger.info(f"Algorithm: {args.algo}, Level: {args.level}, Pigz: {args.pigz}")
+    logger.info(f"Log file: {log_file}")
+    logger.info(f"State file: {json_log_file}")
+
+    # Load or create migration log
+    migration_log = MigrationLog(json_log_file)
+
+    # Get directories to process
+    if args.process_root:
+        directories = [args.source]
+    else:
+        directories = get_subdirectories(args.source)
+
+    logger.info(f"Found {len(directories)} directories to process")
+
+    # Process each directory
+    total_source = 0
+    total_compressed = 0
+    completed = 0
+    errors = 0
+    skipped = 0
+
+    for i, source_subdir in enumerate(directories, 1):
+        relative_path = source_subdir.relative_to(args.source) if not args.process_root else Path('.')
+        dest_subdir = args.dest / relative_path
+
+        # Check for resume
+        if args.resume and migration_log.is_completed(str(source_subdir)):
+            logger.info(f"[{i}/{len(directories)}] Skipping (already completed): {source_subdir}")
+            skipped += 1
+            continue
+
+        logger.info(f"[{i}/{len(directories)}] Processing: {source_subdir}")
+
+        record = process_directory(
+            source_dir=source_subdir,
+            dest_dir=dest_subdir,
+            extensions=args.ext,
+            algo=args.algo,
+            level=args.level,
+            use_pigz=args.pigz,
+            pigz_threads=args.pigz_threads,
+            workers=args.workers,
+            verify=args.verify,
+            dry_run=args.dry_run,
+            logger=logger,
+            migration_log=migration_log
+        )
+
+        total_source += record.total_source_size
+        total_compressed += record.total_compressed_size
+
+        if record.status in ('completed', 'dry_run'):
+            completed += 1
+        elif record.status == 'completed_with_errors':
+            completed += 1
+            errors += 1
+        else:
+            errors += 1
+
+    # Final summary
+    logger.info("=" * 60)
+    logger.info("Migration Summary")
+    logger.info("=" * 60)
+    logger.info(f"Directories processed: {completed}")
+    logger.info(f"Directories skipped (resume): {skipped}")
+    logger.info(f"Directories with errors: {errors}")
+
+    if total_source > 0 and not args.dry_run:
+        ratio = (1 - total_compressed / total_source) * 100
+        saved = total_source - total_compressed
+        logger.info(f"Total original size: {get_size_str(total_source)}")
+        logger.info(f"Total compressed size: {get_size_str(total_compressed)}")
+        logger.info(f"Space saved: {get_size_str(saved)} ({ratio:.1f}%)")
+
+    logger.info(f"Detailed log: {log_file}")
+    logger.info(f"State file (for resume): {json_log_file}")
+
+    return 1 if errors > 0 else 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main(sys.argv[1:]))
