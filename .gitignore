@@ -44,3 +44,6 @@ migration_state.json
 # OS
 .DS_Store
 Thumbs.db
+
+# Claude Code
+.claude/
