@@ -77,15 +77,42 @@ class DirectoryRecord:
     """Record of a directory migration."""
     source_dir: str
     dest_dir: str
-    status: str = 'pending'  # pending, syncing, compressing, completed, error
+    status: str = 'pending'  # pending, syncing, compressing, completed, error, partial
     rsync_command: Optional[str] = None
     rsync_exit_code: Optional[int] = None
+    rsync_log_file: Optional[str] = None
+    rsync_errors: List[str] = field(default_factory=list)
     files: List[FileRecord] = field(default_factory=list)
     total_source_size: int = 0
     total_compressed_size: int = 0
     start_time: Optional[str] = None
     end_time: Optional[str] = None
     error_message: Optional[str] = None
+
+
+# rsync exit codes
+RSYNC_EXIT_CODES = {
+    0: "Success",
+    1: "Syntax or usage error",
+    2: "Protocol incompatibility",
+    3: "Errors selecting input/output files, dirs",
+    4: "Requested action not supported",
+    5: "Error starting client-server protocol",
+    6: "Daemon unable to append to log-file",
+    10: "Error in socket I/O",
+    11: "Error in file I/O",
+    12: "Error in rsync protocol data stream",
+    13: "Errors with program diagnostics",
+    14: "Error in IPC code",
+    20: "Received SIGUSR1 or SIGINT",
+    21: "Some error returned by waitpid()",
+    22: "Error allocating core memory buffers",
+    23: "Partial transfer due to error",
+    24: "Partial transfer due to vanished source files",
+    25: "The --max-delete limit stopped deletions",
+    30: "Timeout in data send/receive",
+    35: "Timeout waiting for daemon connection",
+}
 
 
 class MigrationLog:
@@ -154,11 +181,17 @@ def get_size_str(size_bytes: int) -> str:
     return f"{size_bytes:.2f} PB"
 
 
-def rsync_directory(source: Path, dest: Path, logger: logging.Logger, dry_run: bool = False) -> tuple[int, str]:
+def rsync_directory(
+    source: Path,
+    dest: Path,
+    logger: logging.Logger,
+    log_dir: Path,
+    dry_run: bool = False
+) -> tuple[int, str, Path, List[str]]:
     """
     Rsync a directory with resumable options.
 
-    Returns (exit_code, command_string)
+    Returns (exit_code, command_string, rsync_log_path, error_lines)
     """
     # Ensure destination parent exists
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -170,6 +203,7 @@ def rsync_directory(source: Path, dest: Path, logger: logging.Logger, dry_run: b
         '--progress',       # show progress
         '--checksum',       # use checksum to verify transfers
         '--human-readable',
+        '--itemize-changes',  # detailed output of changes
         str(source) + '/',  # trailing slash = contents of source
         str(dest) + '/'
     ]
@@ -180,8 +214,47 @@ def rsync_directory(source: Path, dest: Path, logger: logging.Logger, dry_run: b
     cmd_str = ' '.join(cmd)
     logger.info(f"Running: {cmd_str}")
 
-    result = subprocess.run(cmd, capture_output=False)
-    return result.returncode, cmd_str
+    # Create rsync-specific log file
+    timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+    rsync_log_path = log_dir / f'rsync_{source.name}_{timestamp}.log'
+
+    error_lines = []
+
+    with open(rsync_log_path, 'w') as log_file:
+        log_file.write(f"Command: {cmd_str}\n")
+        log_file.write(f"Started: {datetime.datetime.now().isoformat()}\n")
+        log_file.write("=" * 60 + "\n\n")
+
+        # Run rsync with output captured and streamed
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1  # Line buffered
+        )
+
+        for line in process.stdout:
+            log_file.write(line)
+            log_file.flush()
+
+            # Detect error lines for summary
+            line_lower = line.lower()
+            if any(err in line_lower for err in ['error', 'permission denied', 'failed', 'cannot']):
+                error_lines.append(line.strip())
+                logger.warning(f"rsync: {line.strip()}")
+
+        process.wait()
+
+        log_file.write("\n" + "=" * 60 + "\n")
+        log_file.write(f"Finished: {datetime.datetime.now().isoformat()}\n")
+        log_file.write(f"Exit code: {process.returncode}\n")
+        if process.returncode in RSYNC_EXIT_CODES:
+            log_file.write(f"Exit meaning: {RSYNC_EXIT_CODES[process.returncode]}\n")
+
+    logger.info(f"rsync log written to: {rsync_log_path}")
+
+    return process.returncode, cmd_str, rsync_log_path, error_lines
 
 
 def compress_file_worker(
@@ -301,7 +374,9 @@ def process_directory(
     verify: bool,
     dry_run: bool,
     logger: logging.Logger,
-    migration_log: MigrationLog
+    migration_log: MigrationLog,
+    log_dir: Path,
+    continue_on_partial: bool = True
 ) -> DirectoryRecord:
     """Process a single directory: rsync then compress."""
 
@@ -314,17 +389,54 @@ def process_directory(
     record.status = 'syncing'
     migration_log.save()
 
-    exit_code, cmd_str = rsync_directory(source_dir, dest_dir, logger, dry_run)
+    exit_code, cmd_str, rsync_log_path, error_lines = rsync_directory(
+        source_dir, dest_dir, logger, log_dir, dry_run
+    )
     record.rsync_command = cmd_str
     record.rsync_exit_code = exit_code
+    record.rsync_log_file = str(rsync_log_path)
+    record.rsync_errors = error_lines
 
-    if exit_code != 0:
+    # Determine if we should continue based on exit code
+    # Exit codes 23 and 24 are partial transfers - some files succeeded
+    is_partial = exit_code in (23, 24)
+    is_fatal = exit_code != 0 and not is_partial
+
+    if is_fatal:
         record.status = 'error'
-        record.error_message = f'rsync failed with exit code {exit_code}'
+        exit_meaning = RSYNC_EXIT_CODES.get(exit_code, "Unknown error")
+        record.error_message = f'rsync failed with exit code {exit_code}: {exit_meaning}'
         record.end_time = datetime.datetime.now().isoformat()
         migration_log.save()
-        logger.error(f"rsync failed for {source_dir}: exit code {exit_code}")
+        logger.error(f"rsync failed for {source_dir}: exit code {exit_code} ({exit_meaning})")
+        logger.error(f"See rsync log for details: {rsync_log_path}")
+        if error_lines:
+            logger.error(f"Errors encountered ({len(error_lines)} total):")
+            for err in error_lines[:10]:  # Show first 10 errors
+                logger.error(f"  {err}")
+            if len(error_lines) > 10:
+                logger.error(f"  ... and {len(error_lines) - 10} more errors")
         return record
+
+    if is_partial:
+        exit_meaning = RSYNC_EXIT_CODES.get(exit_code, "Unknown error")
+        logger.warning(f"rsync partial transfer for {source_dir}: exit code {exit_code} ({exit_meaning})")
+        logger.warning(f"See rsync log for details: {rsync_log_path}")
+        if error_lines:
+            logger.warning(f"Files with errors ({len(error_lines)} total):")
+            for err in error_lines[:10]:
+                logger.warning(f"  {err}")
+            if len(error_lines) > 10:
+                logger.warning(f"  ... and {len(error_lines) - 10} more errors")
+
+        if not continue_on_partial:
+            record.status = 'partial'
+            record.error_message = f'rsync partial transfer: {exit_meaning}. {len(error_lines)} errors.'
+            record.end_time = datetime.datetime.now().isoformat()
+            migration_log.save()
+            return record
+
+        logger.info("Continuing with compression of successfully transferred files...")
 
     if dry_run:
         record.status = 'dry_run'
@@ -376,9 +488,14 @@ def process_directory(
 
     # Check for errors
     errors = [f for f in record.files if f.status == 'error']
-    if errors:
+    if errors or is_partial:
         record.status = 'completed_with_errors'
-        record.error_message = f'{len(errors)} files failed'
+        error_parts = []
+        if is_partial:
+            error_parts.append(f'rsync partial transfer ({len(record.rsync_errors)} files)')
+        if errors:
+            error_parts.append(f'{len(errors)} compression failures')
+        record.error_message = '; '.join(error_parts)
     else:
         record.status = 'completed'
 
@@ -453,6 +570,8 @@ Examples:
                         help='Directory for log files (default: dest directory)')
     parser.add_argument('--process-root', action='store_true',
                         help='Process source as single directory instead of iterating subdirs')
+    parser.add_argument('--stop-on-partial', action='store_true',
+                        help='Stop if rsync has partial transfer errors (default: continue with successful files)')
 
     args = parser.parse_args(argv)
 
@@ -518,7 +637,9 @@ Examples:
             verify=args.verify,
             dry_run=args.dry_run,
             logger=logger,
-            migration_log=migration_log
+            migration_log=migration_log,
+            log_dir=log_dir,
+            continue_on_partial=not args.stop_on_partial
         )
 
         total_source += record.total_source_size
@@ -526,7 +647,7 @@ Examples:
 
         if record.status in ('completed', 'dry_run'):
             completed += 1
-        elif record.status == 'completed_with_errors':
+        elif record.status in ('completed_with_errors', 'partial'):
             completed += 1
             errors += 1
         else:

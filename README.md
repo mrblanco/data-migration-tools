@@ -8,6 +8,8 @@ Tools for compressing and migrating large datasets with support for parallel pro
 - **Resumable transfers** via rsync with `--partial`
 - **Integrity verification** using SHA256 checksums
 - **Extensive logging** with JSON state files for auditing
+- **Detailed rsync logs** capturing per-file transfer status and errors
+- **Partial transfer handling** - continue compressing successfully transferred files
 - **Multiple algorithms** - gzip (fast) or xz (better compression)
 
 ## Installation
@@ -94,11 +96,13 @@ python migrate_compress.py --source /data/original --dest /scratch/migration --p
 | `--resume` | Skip already-completed directories |
 | `--process-root` | Treat source as single directory |
 | `--log-dir` | Directory for log files (default: dest) |
+| `--stop-on-partial` | Stop if rsync has partial failures (default: continue) |
 | `--dry-run` | Show what would be done without changes |
 
 **Output files:**
 
 - `migration_YYYYMMDD_HHMMSS.log` - Human-readable log
+- `rsync_<dirname>_YYYYMMDD_HHMMSS.log` - Detailed rsync output per directory
 - `migration_state.json` - JSON state file for resume and verification
 
 **State file structure:**
@@ -109,6 +113,8 @@ python migrate_compress.py --source /data/original --dest /scratch/migration --p
     "/data/original/subdir1": {
       "status": "completed",
       "rsync_exit_code": 0,
+      "rsync_log_file": "/scratch/migration/rsync_subdir1_20260126_161642.log",
+      "rsync_errors": [],
       "total_source_size": 1234567890,
       "total_compressed_size": 456789012,
       "files": [
@@ -126,6 +132,16 @@ python migrate_compress.py --source /data/original --dest /scratch/migration --p
   }
 }
 ```
+
+**rsync exit codes:**
+
+| Code | Meaning |
+|------|---------|
+| 0 | Success |
+| 23 | Partial transfer due to error (some files failed) |
+| 24 | Partial transfer due to vanished source files |
+
+By default, the script continues compressing successfully transferred files when rsync exits with code 23 or 24. Use `--stop-on-partial` to halt instead.
 
 ## Performance Tuning
 
