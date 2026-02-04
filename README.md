@@ -78,6 +78,9 @@ python migrate_compress.py --source /data/original --dest /scratch/migration --p
 
 # Process source as single directory (don't iterate subdirectories)
 python migrate_compress.py --source /data/original --dest /scratch/migration --process-root --pigz
+
+# Exclude specific folders from the transfer
+python migrate_compress.py --source /data/original --dest /scratch/migration --exclude temp_folder cache logs
 ```
 
 **Options:**
@@ -97,7 +100,18 @@ python migrate_compress.py --source /data/original --dest /scratch/migration --p
 | `--process-root` | Treat source as single directory |
 | `--log-dir` | Directory for log files (default: dest) |
 | `--stop-on-partial` | Stop if rsync has partial failures (default: continue) |
+| `--exclude` | Exclude directories/files matching patterns (rsync syntax) |
 | `--dry-run` | Show what would be done without changes |
+
+**Exclude patterns:**
+
+| Pattern | Excludes |
+|---------|----------|
+| `temp` | Any file/folder named "temp" |
+| `temp/` | Only folders named "temp" |
+| `*.log` | All .log files |
+| `**/cache` | "cache" folder at any depth |
+| `/top_level` | Only at root of source |
 
 **Output files:**
 
