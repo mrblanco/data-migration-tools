@@ -523,14 +523,35 @@ def process_directory(
     return record
 
 
-def get_subdirectories(root: Path, max_depth: int = 1) -> List[Path]:
-    """Get immediate subdirectories of root."""
+def matches_exclude_pattern(name: str, patterns: Optional[List[str]]) -> bool:
+    """Check if a directory name matches any exclude pattern."""
+    if not patterns:
+        return False
+    for pattern in patterns:
+        # Remove trailing slash for comparison
+        pattern_clean = pattern.rstrip('/')
+        # Direct match
+        if name == pattern_clean:
+            return True
+        # Wildcard match (simple glob-style)
+        if pattern_clean.startswith('*') and name.endswith(pattern_clean[1:]):
+            return True
+        if pattern_clean.endswith('*') and name.startswith(pattern_clean[:-1]):
+            return True
+    return False
+
+
+def get_subdirectories(root: Path, max_depth: int = 1, exclude: Optional[List[str]] = None) -> List[Path]:
+    """Get immediate subdirectories of root, excluding specified patterns."""
     if max_depth == 0:
         return [root]
 
     subdirs = []
     for p in root.iterdir():
         if p.is_dir():
+            # Skip directories matching exclude patterns
+            if matches_exclude_pattern(p.name, exclude):
+                continue
             subdirs.append(p)
 
     # Sort for consistent ordering
@@ -616,9 +637,11 @@ Examples:
     if args.process_root:
         directories = [args.source]
     else:
-        directories = get_subdirectories(args.source)
+        directories = get_subdirectories(args.source, exclude=args.exclude)
 
     logger.info(f"Found {len(directories)} directories to process")
+    if args.exclude:
+        logger.info(f"(Excluded directories matching: {args.exclude})")
 
     # Process each directory
     total_source = 0
