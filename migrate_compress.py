@@ -186,7 +186,8 @@ def rsync_directory(
     dest: Path,
     logger: logging.Logger,
     log_dir: Path,
-    dry_run: bool = False
+    dry_run: bool = False,
+    exclude: Optional[List[str]] = None
 ) -> tuple[int, str, Path, List[str]]:
     """
     Rsync a directory with resumable options.
@@ -204,9 +205,17 @@ def rsync_directory(
         '--checksum',       # use checksum to verify transfers
         '--human-readable',
         '--itemize-changes',  # detailed output of changes
+    ]
+
+    # Add exclude patterns
+    if exclude:
+        for pattern in exclude:
+            cmd.append(f'--exclude={pattern}')
+
+    cmd.extend([
         str(source) + '/',  # trailing slash = contents of source
         str(dest) + '/'
-    ]
+    ])
 
     if dry_run:
         cmd.insert(1, '--dry-run')
@@ -376,7 +385,8 @@ def process_directory(
     logger: logging.Logger,
     migration_log: MigrationLog,
     log_dir: Path,
-    continue_on_partial: bool = True
+    continue_on_partial: bool = True,
+    exclude: Optional[List[str]] = None
 ) -> DirectoryRecord:
     """Process a single directory: rsync then compress."""
 
@@ -390,7 +400,7 @@ def process_directory(
     migration_log.save()
 
     exit_code, cmd_str, rsync_log_path, error_lines = rsync_directory(
-        source_dir, dest_dir, logger, log_dir, dry_run
+        source_dir, dest_dir, logger, log_dir, dry_run, exclude
     )
     record.rsync_command = cmd_str
     record.rsync_exit_code = exit_code
@@ -572,6 +582,8 @@ Examples:
                         help='Process source as single directory instead of iterating subdirs')
     parser.add_argument('--stop-on-partial', action='store_true',
                         help='Stop if rsync has partial transfer errors (default: continue with successful files)')
+    parser.add_argument('--exclude', nargs='+', default=None,
+                        help='Exclude directories/files matching these patterns (passed to rsync --exclude)')
 
     args = parser.parse_args(argv)
 
@@ -592,6 +604,8 @@ Examples:
     logger.info(f"Migration started: {args.source} -> {args.dest}")
     logger.info(f"Extensions to compress: {args.ext}")
     logger.info(f"Algorithm: {args.algo}, Level: {args.level}, Pigz: {args.pigz}")
+    if args.exclude:
+        logger.info(f"Excluding patterns: {args.exclude}")
     logger.info(f"Log file: {log_file}")
     logger.info(f"State file: {json_log_file}")
 
@@ -639,7 +653,8 @@ Examples:
             logger=logger,
             migration_log=migration_log,
             log_dir=log_dir,
-            continue_on_partial=not args.stop_on_partial
+            continue_on_partial=not args.stop_on_partial,
+            exclude=args.exclude
         )
 
         total_source += record.total_source_size
