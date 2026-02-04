@@ -157,6 +157,49 @@ python migrate_compress.py --source /data/original --dest /scratch/migration --e
 
 By default, the script continues compressing successfully transferred files when rsync exits with code 23 or 24. Use `--stop-on-partial` to halt instead.
 
+---
+
+### move_to_final.py
+
+Move data from scratch to final destination with verification. Designed to be used after `migrate_compress.py` to complete a two-stage migration workflow.
+
+```bash
+# Dry run - see what would be moved
+python move_to_final.py --source /scratch/data --dest /final/destination --dry-run
+
+# Move with verification (removes source after successful transfer)
+python move_to_final.py --source /scratch/data --dest /final/destination
+
+# Copy mode - keep source files
+python move_to_final.py --source /scratch/data --dest /final/destination --keep-source
+```
+
+**Options:**
+
+| Flag | Description |
+|------|-------------|
+| `-s, --source` | Source directory (scratch location) |
+| `-d, --dest` | Destination directory (final location) |
+| `--log-dir` | Directory for log files (default: source parent) |
+| `--keep-source` | Keep source files after transfer (copy mode) |
+| `--dry-run` | Show what would be done without changes |
+
+**Features:**
+- Uses rsync with `--checksum` for verification
+- `--remove-source-files` deletes source only after successful transfer
+- Cleans up empty directories in source after move
+- JSON log file records all operations for auditing
+
+**Typical workflow:**
+
+```bash
+# Step 1: Compress and copy to scratch
+python migrate_compress.py --source /original/data --dest /scratch/temp --pigz
+
+# Step 2: Move from scratch to final destination
+python move_to_final.py --source /scratch/temp --dest /final/location
+```
+
 ## Performance Tuning
 
 For large datasets, balance parallelism based on your hardware:
