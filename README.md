@@ -101,6 +101,7 @@ python migrate_compress.py --source /data/original --dest /scratch/migration --e
 | `--log-dir` | Directory for log files (default: dest) |
 | `--stop-on-partial` | Stop if rsync has partial failures (default: continue) |
 | `--exclude` | Exclude directories/files matching patterns (rsync syntax) |
+| `--no-progress` | Disable progress bars (useful for non-interactive runs) |
 | `--dry-run` | Show what would be done without changes |
 
 **Exclude patterns:**

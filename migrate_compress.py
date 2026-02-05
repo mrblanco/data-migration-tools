@@ -33,6 +33,13 @@ from functools import partial
 from pathlib import Path
 from typing import List, Optional, Dict, Any
 
+try:
+    from tqdm import tqdm
+    TQDM_AVAILABLE = True
+except ImportError:
+    TQDM_AVAILABLE = False
+    tqdm = None
+
 CHUNK = 1024 * 1024  # 1MB buffer
 
 # Configure logging
@@ -386,7 +393,8 @@ def process_directory(
     migration_log: MigrationLog,
     log_dir: Path,
     continue_on_partial: bool = True,
-    exclude: Optional[List[str]] = None
+    exclude: Optional[List[str]] = None,
+    show_progress: bool = True
 ) -> DirectoryRecord:
     """Process a single directory: rsync then compress."""
 
@@ -478,12 +486,31 @@ def process_directory(
     record.total_source_size = 0
     record.total_compressed_size = 0
 
+    # Calculate total size for progress bar
+    total_bytes = sum(f.stat().st_size for f in files_to_compress)
+
     with multiprocessing.Pool(processes=workers) as pool:
+        # Setup progress bar for file compression
+        if show_progress and TQDM_AVAILABLE:
+            pbar = tqdm(
+                total=total_bytes,
+                unit='B',
+                unit_scale=True,
+                desc=f"Compressing {dest_dir.name}",
+                leave=False
+            )
+        else:
+            pbar = None
+
         for file_record in pool.imap_unordered(compress_file_worker, work_items):
             record.files.append(file_record)
             record.total_source_size += file_record.original_size
             if file_record.compressed_size:
                 record.total_compressed_size += file_record.compressed_size
+
+            # Update progress bar
+            if pbar:
+                pbar.update(file_record.original_size)
 
             if file_record.status in ('compressed', 'verified'):
                 ratio = (1 - file_record.compressed_size / file_record.original_size) * 100 if file_record.original_size > 0 else 0
@@ -495,6 +522,9 @@ def process_directory(
 
             # Save progress periodically
             migration_log.save()
+
+        if pbar:
+            pbar.close()
 
     # Check for errors
     errors = [f for f in record.files if f.status == 'error']
@@ -605,6 +635,8 @@ Examples:
                         help='Stop if rsync has partial transfer errors (default: continue with successful files)')
     parser.add_argument('--exclude', nargs='+', default=None,
                         help='Exclude directories/files matching these patterns (passed to rsync --exclude)')
+    parser.add_argument('--no-progress', action='store_true',
+                        help='Disable progress bars (useful for non-interactive runs)')
 
     args = parser.parse_args(argv)
 
@@ -643,6 +675,13 @@ Examples:
     if args.exclude:
         logger.info(f"(Excluded directories matching: {args.exclude})")
 
+    # Determine if we should show progress bars
+    show_progress = TQDM_AVAILABLE and not args.no_progress
+    if args.no_progress:
+        logger.info("Progress bars disabled")
+    elif not TQDM_AVAILABLE:
+        logger.info("Install tqdm for progress bars: conda install tqdm")
+
     # Process each directory
     total_source = 0
     total_compressed = 0
@@ -650,7 +689,20 @@ Examples:
     errors = 0
     skipped = 0
 
-    for i, source_subdir in enumerate(directories, 1):
+    # Setup main progress bar for directories
+    if show_progress:
+        dir_pbar = tqdm(
+            directories,
+            desc="Overall progress",
+            unit="dir",
+            position=0
+        )
+        dir_iterator = dir_pbar
+    else:
+        dir_iterator = directories
+        dir_pbar = None
+
+    for i, source_subdir in enumerate(dir_iterator, 1):
         relative_path = source_subdir.relative_to(args.source) if not args.process_root else Path('.')
         dest_subdir = args.dest / relative_path
 
@@ -661,6 +713,10 @@ Examples:
             continue
 
         logger.info(f"[{i}/{len(directories)}] Processing: {source_subdir}")
+
+        # Update progress bar description
+        if dir_pbar:
+            dir_pbar.set_postfix_str(source_subdir.name)
 
         record = process_directory(
             source_dir=source_subdir,
@@ -677,7 +733,8 @@ Examples:
             migration_log=migration_log,
             log_dir=log_dir,
             continue_on_partial=not args.stop_on_partial,
-            exclude=args.exclude
+            exclude=args.exclude,
+            show_progress=show_progress
         )
 
         total_source += record.total_source_size
@@ -690,6 +747,10 @@ Examples:
             errors += 1
         else:
             errors += 1
+
+    # Close progress bar
+    if dir_pbar:
+        dir_pbar.close()
 
     # Final summary
     logger.info("=" * 60)
