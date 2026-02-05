@@ -1,0 +1,7 @@
+# Source directories for migration (one per line)
+# Lines starting with # are comments
+# Empty lines are ignored
+
+/groups/guttman/projects/chip-dip/2021_Histone-ABCAM_Merge
+# /groups/guttman/projects/chip-dip/another_dataset
+# /groups/guttman/projects/chip-dip/third_dataset

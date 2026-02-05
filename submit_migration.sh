@@ -12,18 +12,29 @@ source ~/.bashrc
 conda activate compress_files
 
 # --- Configuration ---
-# List of source directories to process (one per line)
-# For job arrays, each task processes one directory
-SOURCES=(
-    "/groups/guttman/projects/chip-dip/2021_Histone-ABCAM_Merge"
-    # Add more directories here for job arrays:
-    # "/groups/guttman/projects/chip-dip/another_dataset"
-    # "/groups/guttman/projects/chip-dip/third_dataset"
-)
-
+# File containing source directories (one per line)
+# Lines starting with # are comments, empty lines are ignored
+SOURCES_FILE="${SOURCES_FILE:-sources.txt}"
 SCRATCH_BASE="/resnick/scratch/mblanco"
 FINAL_BASE="/resnick/groups/guttman/projects/chip-dip"
 EXCLUDE=".snakemake/"
+
+# --- Read directories from file ---
+if [ ! -f "$SOURCES_FILE" ]; then
+    echo "Error: Sources file not found: $SOURCES_FILE"
+    echo "Create a file with one source directory per line, or set SOURCES_FILE env variable"
+    exit 1
+fi
+
+# Read non-empty, non-comment lines into array
+mapfile -t SOURCES < <(grep -v '^\s*#' "$SOURCES_FILE" | grep -v '^\s*$')
+
+if [ ${#SOURCES[@]} -eq 0 ]; then
+    echo "Error: No directories found in $SOURCES_FILE"
+    exit 1
+fi
+
+echo "Loaded ${#SOURCES[@]} directories from $SOURCES_FILE"
 
 # --- Job Array Logic ---
 # If running as array job, use SLURM_ARRAY_TASK_ID to select source
