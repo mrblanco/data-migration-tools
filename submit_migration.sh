@@ -68,6 +68,7 @@ for source in "${SOURCES_TO_PROCESS[@]}"; do
     echo "========================================"
 
     # Step 1: Migrate and compress to scratch
+    # --check-existing skips files that already exist in final destination
     python ./data-migration-tools/migrate_compress.py \
         --source "$source" \
         --dest "$destination" \
@@ -75,6 +76,8 @@ for source in "${SOURCES_TO_PROCESS[@]}"; do
         --pigz-threads 4 \
         --workers 4 \
         --exclude "$EXCLUDE" \
+        --check-existing \
+        --check-path "$finaldest" \
         --no-progress  # Disable progress bars for batch jobs
 
     if [ $? -ne 0 ]; then
