@@ -273,6 +273,184 @@ def rsync_directory(
     return process.returncode, cmd_str, rsync_log_path, error_lines
 
 
+def rsync_root_files(
+    source: Path,
+    dest: Path,
+    logger: logging.Logger,
+    log_dir: Path,
+    dry_run: bool = False,
+    exclude: Optional[List[str]] = None
+) -> tuple[int, str, Path, List[str]]:
+    """
+    Rsync only the files (not directories) from the source root to destination.
+
+    This handles files that are directly in the source directory but not in subdirectories.
+    Returns (exit_code, command_string, rsync_log_path, error_lines)
+    """
+    # Check if there are any files in the root (not directories)
+    root_files = [f for f in source.iterdir() if f.is_file()]
+    if not root_files:
+        logger.info("No root-level files to copy")
+        return 0, "", Path("/dev/null"), []
+
+    logger.info(f"Found {len(root_files)} root-level files to copy")
+
+    # Ensure destination exists
+    dest.mkdir(parents=True, exist_ok=True)
+
+    cmd = [
+        'rsync',
+        '-av',              # archive mode, verbose
+        '--partial',        # keep partially transferred files for resume
+        '--progress',       # show progress
+        '--checksum',       # use checksum to verify transfers
+        '--human-readable',
+        '--itemize-changes',  # detailed output of changes
+        '--exclude=*/',     # exclude all directories (only copy files)
+    ]
+
+    # Add exclude patterns
+    if exclude:
+        for pattern in exclude:
+            cmd.append(f'--exclude={pattern}')
+
+    cmd.extend([
+        str(source) + '/',  # trailing slash = contents of source
+        str(dest) + '/'
+    ])
+
+    if dry_run:
+        cmd.insert(1, '--dry-run')
+
+    cmd_str = ' '.join(cmd)
+    logger.info(f"Running: {cmd_str}")
+
+    # Create rsync-specific log file
+    timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+    rsync_log_path = log_dir / f'rsync_root_files_{timestamp}.log'
+
+    error_lines = []
+
+    with open(rsync_log_path, 'w') as log_file:
+        log_file.write(f"Command: {cmd_str}\n")
+        log_file.write(f"Started: {datetime.datetime.now().isoformat()}\n")
+        log_file.write(f"Root-level files: {len(root_files)}\n")
+        log_file.write("=" * 60 + "\n\n")
+
+        # Run rsync with output captured and streamed
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1  # Line buffered
+        )
+
+        for line in process.stdout:
+            log_file.write(line)
+            log_file.flush()
+
+            # Detect error lines for summary
+            line_lower = line.lower()
+            if any(err in line_lower for err in ['error', 'permission denied', 'failed', 'cannot']):
+                error_lines.append(line.strip())
+                logger.warning(f"rsync: {line.strip()}")
+
+        process.wait()
+
+        log_file.write("\n" + "=" * 60 + "\n")
+        log_file.write(f"Finished: {datetime.datetime.now().isoformat()}\n")
+        log_file.write(f"Exit code: {process.returncode}\n")
+        if process.returncode in RSYNC_EXIT_CODES:
+            log_file.write(f"Exit meaning: {RSYNC_EXIT_CODES[process.returncode]}\n")
+
+    logger.info(f"rsync log written to: {rsync_log_path}")
+
+    return process.returncode, cmd_str, rsync_log_path, error_lines
+
+
+def compress_root_files(
+    dest: Path,
+    extensions: List[str],
+    algo: str,
+    level: int,
+    use_pigz: bool,
+    pigz_threads: int,
+    workers: int,
+    verify: bool,
+    logger: logging.Logger,
+    show_progress: bool = True
+) -> tuple[int, int, int]:
+    """
+    Compress root-level files in the destination directory.
+
+    Returns (total_source_size, total_compressed_size, error_count)
+    """
+    files_to_compress = []
+    normalized_ext = {e.lower().lstrip('.') for e in extensions}
+
+    for f in dest.iterdir():
+        if f.is_file():
+            suffix = f.suffix.lower().lstrip('.')
+            if suffix in normalized_ext:
+                files_to_compress.append(f)
+
+    if not files_to_compress:
+        logger.info("No root-level files to compress")
+        return 0, 0, 0
+
+    logger.info(f"Found {len(files_to_compress)} root-level files to compress")
+
+    # Prepare worker arguments
+    work_items = [
+        (f, f, algo, level, use_pigz, pigz_threads, verify)
+        for f in files_to_compress
+    ]
+
+    total_source_size = 0
+    total_compressed_size = 0
+    error_count = 0
+
+    # Calculate total size for progress bar
+    total_bytes = sum(f.stat().st_size for f in files_to_compress)
+
+    with multiprocessing.Pool(processes=workers) as pool:
+        # Setup progress bar for file compression
+        if show_progress and TQDM_AVAILABLE:
+            pbar = tqdm(
+                total=total_bytes,
+                unit='B',
+                unit_scale=True,
+                desc="Compressing root files",
+                leave=False
+            )
+        else:
+            pbar = None
+
+        for file_record in pool.imap_unordered(compress_file_worker, work_items):
+            total_source_size += file_record.original_size
+            if file_record.compressed_size:
+                total_compressed_size += file_record.compressed_size
+
+            # Update progress bar
+            if pbar:
+                pbar.update(file_record.original_size)
+
+            if file_record.status in ('compressed', 'verified'):
+                ratio = (1 - file_record.compressed_size / file_record.original_size) * 100 if file_record.original_size > 0 else 0
+                logger.info(f"OK {file_record.source_path} -> {get_size_str(file_record.compressed_size)} ({ratio:.1f}% reduction)")
+            elif file_record.status == 'skipped':
+                logger.debug(f"SKIP {file_record.source_path} (already compressed)")
+            else:
+                logger.error(f"ERROR {file_record.source_path}: {file_record.error_message}")
+                error_count += 1
+
+        if pbar:
+            pbar.close()
+
+    return total_source_size, total_compressed_size, error_count
+
+
 def compress_file_worker(
     args: tuple[Path, Path, str, int, bool, int, bool]
 ) -> FileRecord:
@@ -688,6 +866,50 @@ Examples:
     completed = 0
     errors = 0
     skipped = 0
+
+    # Handle root-level files first (when not using --process-root)
+    if not args.process_root:
+        logger.info("=" * 60)
+        logger.info("Processing root-level files")
+        logger.info("=" * 60)
+
+        # Rsync root-level files
+        exit_code, _, rsync_log, error_lines = rsync_root_files(
+            source=args.source,
+            dest=args.dest,
+            logger=logger,
+            log_dir=log_dir,
+            dry_run=args.dry_run,
+            exclude=args.exclude
+        )
+
+        if exit_code != 0 and exit_code not in (23, 24):
+            logger.error(f"rsync root files failed with exit code {exit_code}")
+            if error_lines:
+                for err in error_lines[:5]:
+                    logger.error(f"  {err}")
+
+        # Compress root-level files (if not dry run)
+        if not args.dry_run:
+            root_source, root_compressed, root_errors = compress_root_files(
+                dest=args.dest,
+                extensions=args.ext,
+                algo=args.algo,
+                level=args.level,
+                use_pigz=args.pigz,
+                pigz_threads=args.pigz_threads,
+                workers=args.workers,
+                verify=args.verify,
+                logger=logger,
+                show_progress=show_progress
+            )
+            total_source += root_source
+            total_compressed += root_compressed
+            if root_errors > 0:
+                errors += 1
+
+        logger.info("Root-level files complete")
+        logger.info("=" * 60)
 
     # Setup main progress bar for directories
     if show_progress:
