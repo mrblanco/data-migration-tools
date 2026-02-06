@@ -81,6 +81,9 @@ python migrate_compress.py --source /data/original --dest /scratch/migration --p
 
 # Exclude specific folders from the transfer
 python migrate_compress.py --source /data/original --dest /scratch/migration --exclude temp_folder cache logs
+
+# Skip files that already exist in final destination (useful for re-running)
+python migrate_compress.py --source /data/original --dest /scratch/migration --pigz --check-existing --check-path /final/destination
 ```
 
 **Options:**
@@ -102,6 +105,8 @@ python migrate_compress.py --source /data/original --dest /scratch/migration --e
 | `--stop-on-partial` | Stop if rsync has partial failures (default: continue) |
 | `--exclude` | Exclude directories/files matching patterns (rsync syntax) |
 | `--no-progress` | Disable progress bars (useful for non-interactive runs) |
+| `--check-existing` | Skip files that already exist (compressed or not) in destination |
+| `--check-path` | Path to check for existing files (default: --dest). Use for final destination |
 | `--dry-run` | Show what would be done without changes |
 
 **Exclude patterns:**

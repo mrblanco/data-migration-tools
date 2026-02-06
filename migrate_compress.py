@@ -188,13 +188,106 @@ def get_size_str(size_bytes: int) -> str:
     return f"{size_bytes:.2f} PB"
 
 
+def find_existing_files(
+    check_path: Path,
+    source_path: Path,
+    extensions_to_compress: List[str],
+    logger: logging.Logger
+) -> set[str]:
+    """
+    Find files that already exist in check_path (including compressed versions).
+
+    Returns a set of relative paths (from source_path) that should be excluded
+    because they already exist in check_path.
+
+    For example, if source has 'data.tsv' and check_path has 'data.tsv.gz',
+    'data.tsv' will be in the returned set.
+    """
+    if not check_path.exists():
+        logger.info(f"Check path does not exist: {check_path}")
+        return set()
+
+    # Compression suffixes to check
+    compression_suffixes = ['.gz', '.xz']
+
+    # Normalize extensions
+    normalized_ext = {e.lower().lstrip('.') for e in extensions_to_compress}
+
+    # Build a set of existing files in check_path (including their base names without compression)
+    existing_files = set()
+    existing_bases = set()  # file names without compression suffix
+
+    for f in check_path.rglob('*'):
+        if f.is_file():
+            rel_path = f.relative_to(check_path)
+            existing_files.add(str(rel_path))
+
+            # Also track base names (without compression suffix)
+            name = f.name
+            for suffix in compression_suffixes:
+                if name.endswith(suffix):
+                    base_name = name[:-len(suffix)]
+                    base_rel = rel_path.parent / base_name
+                    existing_bases.add(str(base_rel))
+                    break
+
+    # Now find source files that should be excluded
+    exclude_files = set()
+
+    for f in source_path.rglob('*'):
+        if f.is_file():
+            rel_path = f.relative_to(source_path)
+            rel_str = str(rel_path)
+
+            # Check if this exact file exists
+            if rel_str in existing_files:
+                exclude_files.add(rel_str)
+                continue
+
+            # Check if compressed version exists (for compressible files)
+            suffix = f.suffix.lower().lstrip('.')
+            if suffix in normalized_ext:
+                for comp_suffix in compression_suffixes:
+                    compressed_rel = rel_str + comp_suffix
+                    if compressed_rel in existing_files:
+                        exclude_files.add(rel_str)
+                        break
+
+    return exclude_files
+
+
+def generate_exclude_file(
+    exclude_files: set[str],
+    log_dir: Path,
+    logger: logging.Logger
+) -> Optional[Path]:
+    """
+    Generate a temporary file containing rsync exclude patterns.
+
+    Returns path to exclude file, or None if no files to exclude.
+    """
+    if not exclude_files:
+        return None
+
+    timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+    exclude_file = log_dir / f'rsync_exclude_{timestamp}.txt'
+
+    with open(exclude_file, 'w') as f:
+        for file_path in sorted(exclude_files):
+            f.write(f'{file_path}\n')
+
+    logger.info(f"Generated exclude file with {len(exclude_files)} files: {exclude_file}")
+    return exclude_file
+
+
 def rsync_directory(
     source: Path,
     dest: Path,
     logger: logging.Logger,
     log_dir: Path,
     dry_run: bool = False,
-    exclude: Optional[List[str]] = None
+    exclude: Optional[List[str]] = None,
+    exclude_from_file: Optional[Path] = None
 ) -> tuple[int, str, Path, List[str]]:
     """
     Rsync a directory with resumable options.
@@ -218,6 +311,10 @@ def rsync_directory(
     if exclude:
         for pattern in exclude:
             cmd.append(f'--exclude={pattern}')
+
+    # Add exclude-from file (for skipping existing files)
+    if exclude_from_file and exclude_from_file.exists():
+        cmd.append(f'--exclude-from={exclude_from_file}')
 
     cmd.extend([
         str(source) + '/',  # trailing slash = contents of source
@@ -279,7 +376,8 @@ def rsync_root_files(
     logger: logging.Logger,
     log_dir: Path,
     dry_run: bool = False,
-    exclude: Optional[List[str]] = None
+    exclude: Optional[List[str]] = None,
+    exclude_from_file: Optional[Path] = None
 ) -> tuple[int, str, Path, List[str]]:
     """
     Rsync only the files (not directories) from the source root to destination.
@@ -313,6 +411,10 @@ def rsync_root_files(
     if exclude:
         for pattern in exclude:
             cmd.append(f'--exclude={pattern}')
+
+    # Add exclude-from file (for skipping existing files)
+    if exclude_from_file and exclude_from_file.exists():
+        cmd.append(f'--exclude-from={exclude_from_file}')
 
     cmd.extend([
         str(source) + '/',  # trailing slash = contents of source
@@ -572,7 +674,8 @@ def process_directory(
     log_dir: Path,
     continue_on_partial: bool = True,
     exclude: Optional[List[str]] = None,
-    show_progress: bool = True
+    show_progress: bool = True,
+    exclude_from_file: Optional[Path] = None
 ) -> DirectoryRecord:
     """Process a single directory: rsync then compress."""
 
@@ -586,7 +689,7 @@ def process_directory(
     migration_log.save()
 
     exit_code, cmd_str, rsync_log_path, error_lines = rsync_directory(
-        source_dir, dest_dir, logger, log_dir, dry_run, exclude
+        source_dir, dest_dir, logger, log_dir, dry_run, exclude, exclude_from_file
     )
     record.rsync_command = cmd_str
     record.rsync_exit_code = exit_code
@@ -815,6 +918,10 @@ Examples:
                         help='Exclude directories/files matching these patterns (passed to rsync --exclude)')
     parser.add_argument('--no-progress', action='store_true',
                         help='Disable progress bars (useful for non-interactive runs)')
+    parser.add_argument('--check-existing', action='store_true',
+                        help='Skip files that already exist (compressed or not) in destination or check-path')
+    parser.add_argument('--check-path', type=Path, default=None,
+                        help='Path to check for existing files (e.g., final destination). If not set, checks --dest')
 
     args = parser.parse_args(argv)
 
@@ -842,6 +949,25 @@ Examples:
 
     # Load or create migration log
     migration_log = MigrationLog(json_log_file)
+
+    # Check for existing files if requested
+    exclude_from_file = None
+    if args.check_existing:
+        check_path = args.check_path or args.dest
+        logger.info(f"Checking for existing files in: {check_path}")
+
+        existing_files = find_existing_files(
+            check_path=check_path,
+            source_path=args.source,
+            extensions_to_compress=args.ext,
+            logger=logger
+        )
+
+        if existing_files:
+            logger.info(f"Found {len(existing_files)} files that already exist (will be skipped)")
+            exclude_from_file = generate_exclude_file(existing_files, log_dir, logger)
+        else:
+            logger.info("No existing files found - all files will be transferred")
 
     # Get directories to process
     if args.process_root:
@@ -880,7 +1006,8 @@ Examples:
             logger=logger,
             log_dir=log_dir,
             dry_run=args.dry_run,
-            exclude=args.exclude
+            exclude=args.exclude,
+            exclude_from_file=exclude_from_file
         )
 
         if exit_code != 0 and exit_code not in (23, 24):
@@ -956,7 +1083,8 @@ Examples:
             log_dir=log_dir,
             continue_on_partial=not args.stop_on_partial,
             exclude=args.exclude,
-            show_progress=show_progress
+            show_progress=show_progress,
+            exclude_from_file=exclude_from_file
         )
 
         total_source += record.total_source_size
