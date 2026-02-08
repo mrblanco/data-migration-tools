@@ -1,0 +1,561 @@
+#!/usr/bin/env python3
+"""
+S3 Backup Tool - Upload directories to AWS S3 with parallel processing and resume capability.
+
+Features:
+- Parallel uploads using concurrent threads
+- Resumable transfers via JSON state file
+- Support for S3 storage classes (DEEP_ARCHIVE, GLACIER, etc.)
+- Extensive logging with progress tracking
+- Dry-run mode for previewing uploads
+
+Usage:
+    python s3_backup.py --source /path/to/data --bucket my-bucket --prefix backup/data
+    python s3_backup.py --source /path/to/data --bucket my-bucket --storage-class DEEP_ARCHIVE
+    python s3_backup.py --source /path/to/data --bucket my-bucket --resume  # Resume interrupted upload
+"""
+
+import argparse
+import datetime
+import hashlib
+import json
+import logging
+import os
+import subprocess
+import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field, asdict
+from pathlib import Path
+from typing import List, Optional, Dict, Any
+
+try:
+    from tqdm import tqdm
+    TQDM_AVAILABLE = True
+except ImportError:
+    TQDM_AVAILABLE = False
+    tqdm = None
+
+# Valid S3 storage classes
+STORAGE_CLASSES = [
+    'STANDARD',
+    'REDUCED_REDUNDANCY',
+    'STANDARD_IA',
+    'ONEZONE_IA',
+    'INTELLIGENT_TIERING',
+    'GLACIER',
+    'DEEP_ARCHIVE',
+    'GLACIER_IR',
+]
+
+CHUNK = 1024 * 1024  # 1MB buffer for checksums
+
+
+def setup_logging(log_file: Path) -> logging.Logger:
+    """Setup logging to both console and file."""
+    logger = logging.getLogger('s3_backup')
+    logger.setLevel(logging.DEBUG)
+
+    # Console handler (INFO level)
+    console = logging.StreamHandler()
+    console.setLevel(logging.INFO)
+    console.setFormatter(logging.Formatter('%(message)s'))
+
+    # File handler (DEBUG level)
+    file_handler = logging.FileHandler(log_file)
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(logging.Formatter(
+        '%(asctime)s - %(levelname)s - %(message)s'
+    ))
+
+    logger.addHandler(console)
+    logger.addHandler(file_handler)
+
+    return logger
+
+
+@dataclass
+class FileRecord:
+    """Record of a single file upload."""
+    local_path: str
+    s3_key: str
+    size: int
+    md5: Optional[str] = None
+    status: str = 'pending'  # pending, uploading, uploaded, error, skipped
+    upload_time: Optional[str] = None
+    error_message: Optional[str] = None
+
+
+@dataclass
+class BackupState:
+    """State of the entire backup operation."""
+    source: str
+    bucket: str
+    prefix: str
+    storage_class: str
+    start_time: str
+    end_time: Optional[str] = None
+    status: str = 'in_progress'  # in_progress, completed, completed_with_errors
+    total_files: int = 0
+    uploaded_files: int = 0
+    skipped_files: int = 0
+    error_files: int = 0
+    total_bytes: int = 0
+    uploaded_bytes: int = 0
+    files: Dict[str, dict] = field(default_factory=dict)
+
+    def save(self, path: Path):
+        """Save state to JSON file."""
+        with open(path, 'w') as f:
+            json.dump(asdict(self), f, indent=2)
+
+    @classmethod
+    def load(cls, path: Path) -> 'BackupState':
+        """Load state from JSON file."""
+        with open(path, 'r') as f:
+            data = json.load(f)
+        state = cls(
+            source=data['source'],
+            bucket=data['bucket'],
+            prefix=data['prefix'],
+            storage_class=data['storage_class'],
+            start_time=data['start_time'],
+        )
+        state.end_time = data.get('end_time')
+        state.status = data.get('status', 'in_progress')
+        state.total_files = data.get('total_files', 0)
+        state.uploaded_files = data.get('uploaded_files', 0)
+        state.skipped_files = data.get('skipped_files', 0)
+        state.error_files = data.get('error_files', 0)
+        state.total_bytes = data.get('total_bytes', 0)
+        state.uploaded_bytes = data.get('uploaded_bytes', 0)
+        state.files = data.get('files', {})
+        return state
+
+    def is_uploaded(self, local_path: str) -> bool:
+        """Check if a file has already been uploaded."""
+        file_info = self.files.get(local_path)
+        return file_info is not None and file_info.get('status') == 'uploaded'
+
+
+def get_size_str(size_bytes: int) -> str:
+    """Convert bytes to human-readable string."""
+    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+        if size_bytes < 1024:
+            return f"{size_bytes:.2f} {unit}"
+        size_bytes /= 1024
+    return f"{size_bytes:.2f} PB"
+
+
+def calculate_md5(file_path: Path) -> str:
+    """Calculate MD5 hash of a file."""
+    md5 = hashlib.md5()
+    with open(file_path, 'rb') as f:
+        while chunk := f.read(CHUNK):
+            md5.update(chunk)
+    return md5.hexdigest()
+
+
+def get_files_to_upload(
+    source: Path,
+    exclude: Optional[List[str]] = None
+) -> List[Path]:
+    """Get list of files to upload, respecting exclusions."""
+    files = []
+    exclude_set = set(exclude) if exclude else set()
+
+    for f in source.rglob('*'):
+        if f.is_file():
+            # Check exclusions
+            rel_path = f.relative_to(source)
+            skip = False
+
+            for pattern in exclude_set:
+                # Simple pattern matching
+                if pattern.endswith('/'):
+                    # Directory pattern
+                    dir_name = pattern.rstrip('/')
+                    if any(part == dir_name for part in rel_path.parts[:-1]):
+                        skip = True
+                        break
+                elif '*' in pattern:
+                    # Glob pattern (simple)
+                    import fnmatch
+                    if fnmatch.fnmatch(f.name, pattern):
+                        skip = True
+                        break
+                else:
+                    # Exact match
+                    if f.name == pattern or any(part == pattern for part in rel_path.parts):
+                        skip = True
+                        break
+
+            if not skip:
+                files.append(f)
+
+    return files
+
+
+def upload_file(
+    local_path: Path,
+    bucket: str,
+    s3_key: str,
+    storage_class: str,
+    dry_run: bool = False,
+    calculate_checksum: bool = False
+) -> FileRecord:
+    """
+    Upload a single file to S3.
+
+    Returns FileRecord with upload status.
+    """
+    record = FileRecord(
+        local_path=str(local_path),
+        s3_key=s3_key,
+        size=local_path.stat().st_size
+    )
+
+    if calculate_checksum:
+        record.md5 = calculate_md5(local_path)
+
+    if dry_run:
+        record.status = 'dry_run'
+        return record
+
+    record.status = 'uploading'
+
+    s3_uri = f"s3://{bucket}/{s3_key}"
+
+    cmd = [
+        'aws', 's3', 'cp',
+        str(local_path),
+        s3_uri,
+        '--storage-class', storage_class,
+    ]
+
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=3600  # 1 hour timeout per file
+        )
+
+        if result.returncode == 0:
+            record.status = 'uploaded'
+            record.upload_time = datetime.datetime.now().isoformat()
+        else:
+            record.status = 'error'
+            record.error_message = result.stderr.strip() or result.stdout.strip()
+
+    except subprocess.TimeoutExpired:
+        record.status = 'error'
+        record.error_message = 'Upload timed out after 1 hour'
+    except Exception as e:
+        record.status = 'error'
+        record.error_message = str(e)
+
+    return record
+
+
+def check_aws_cli() -> bool:
+    """Check if AWS CLI is installed and configured."""
+    try:
+        result = subprocess.run(
+            ['aws', 'sts', 'get-caller-identity'],
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+        return result.returncode == 0
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return False
+
+
+def check_bucket_access(bucket: str) -> bool:
+    """Check if we have access to the S3 bucket."""
+    try:
+        result = subprocess.run(
+            ['aws', 's3', 'ls', f's3://{bucket}', '--max-items', '1'],
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+        return result.returncode == 0
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return False
+
+
+def main(argv: List[str] = None) -> int:
+    parser = argparse.ArgumentParser(
+        description='Upload directories to AWS S3 with parallel processing and resume capability.',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Basic upload to S3
+  python s3_backup.py --source /data/project --bucket my-bucket --prefix backups/project
+
+  # Upload with DEEP_ARCHIVE storage class
+  python s3_backup.py --source /data/project --bucket my-bucket --storage-class DEEP_ARCHIVE
+
+  # Resume an interrupted upload
+  python s3_backup.py --source /data/project --bucket my-bucket --resume
+
+  # Dry run to see what would be uploaded
+  python s3_backup.py --source /data/project --bucket my-bucket --dry-run
+
+  # Parallel upload with 8 workers
+  python s3_backup.py --source /data/project --bucket my-bucket --workers 8
+        """
+    )
+
+    parser.add_argument('-s', '--source', type=Path, required=True,
+                        help='Source directory to backup')
+    parser.add_argument('-b', '--bucket', type=str, required=True,
+                        help='S3 bucket name')
+    parser.add_argument('-p', '--prefix', type=str, default='',
+                        help='S3 key prefix (folder path in bucket)')
+    parser.add_argument('--storage-class', type=str, default='DEEP_ARCHIVE',
+                        choices=STORAGE_CLASSES,
+                        help='S3 storage class (default: DEEP_ARCHIVE)')
+    parser.add_argument('--workers', type=int, default=4,
+                        help='Number of parallel upload workers (default: 4)')
+    parser.add_argument('--resume', action='store_true',
+                        help='Resume from previous state file')
+    parser.add_argument('--checksum', action='store_true',
+                        help='Calculate and log MD5 checksums')
+    parser.add_argument('--exclude', nargs='+', default=None,
+                        help='Exclude files/directories matching patterns')
+    parser.add_argument('--log-dir', type=Path, default=None,
+                        help='Directory for log files (default: current directory)')
+    parser.add_argument('--no-progress', action='store_true',
+                        help='Disable progress bars')
+    parser.add_argument('--dry-run', action='store_true',
+                        help='Show what would be uploaded without actually uploading')
+
+    args = parser.parse_args(argv)
+
+    # Validate source
+    if not args.source.exists():
+        print(f"Error: Source path does not exist: {args.source}", file=sys.stderr)
+        return 1
+
+    if not args.source.is_dir():
+        print(f"Error: Source must be a directory: {args.source}", file=sys.stderr)
+        return 1
+
+    # Setup logging
+    log_dir = args.log_dir or Path.cwd()
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+    log_file = log_dir / f's3_backup_{timestamp}.log'
+    state_file = log_dir / 's3_backup_state.json'
+
+    logger = setup_logging(log_file)
+
+    logger.info("=" * 60)
+    logger.info("S3 Backup Tool")
+    logger.info("=" * 60)
+
+    # Check AWS CLI
+    if not args.dry_run:
+        logger.info("Checking AWS CLI configuration...")
+        if not check_aws_cli():
+            logger.error("AWS CLI is not installed or not configured")
+            logger.error("Run 'aws configure' to set up credentials")
+            return 1
+
+        logger.info("Checking bucket access...")
+        if not check_bucket_access(args.bucket):
+            logger.error(f"Cannot access bucket: {args.bucket}")
+            logger.error("Check bucket name and permissions")
+            return 1
+
+    logger.info(f"Source: {args.source}")
+    logger.info(f"Bucket: {args.bucket}")
+    logger.info(f"Prefix: {args.prefix or '(root)'}")
+    logger.info(f"Storage class: {args.storage_class}")
+    logger.info(f"Workers: {args.workers}")
+    if args.exclude:
+        logger.info(f"Excluding: {args.exclude}")
+    if args.dry_run:
+        logger.info("DRY RUN - no files will be uploaded")
+
+    # Load or create state
+    if args.resume and state_file.exists():
+        logger.info(f"Resuming from state file: {state_file}")
+        state = BackupState.load(state_file)
+
+        # Validate state matches current parameters
+        if state.source != str(args.source):
+            logger.warning(f"Source mismatch: state has {state.source}, using {args.source}")
+        if state.bucket != args.bucket:
+            logger.error(f"Bucket mismatch: state has {state.bucket}, command has {args.bucket}")
+            return 1
+    else:
+        state = BackupState(
+            source=str(args.source),
+            bucket=args.bucket,
+            prefix=args.prefix,
+            storage_class=args.storage_class,
+            start_time=datetime.datetime.now().isoformat()
+        )
+
+    # Get files to upload
+    logger.info("Scanning source directory...")
+    all_files = get_files_to_upload(args.source, args.exclude)
+    logger.info(f"Found {len(all_files)} files")
+
+    # Calculate total size
+    total_size = sum(f.stat().st_size for f in all_files)
+    logger.info(f"Total size: {get_size_str(total_size)}")
+
+    state.total_files = len(all_files)
+    state.total_bytes = total_size
+
+    # Filter out already uploaded files if resuming
+    files_to_upload = []
+    for f in all_files:
+        if state.is_uploaded(str(f)):
+            state.skipped_files += 1
+        else:
+            files_to_upload.append(f)
+
+    if state.skipped_files > 0:
+        logger.info(f"Skipping {state.skipped_files} already uploaded files")
+
+    logger.info(f"Files to upload: {len(files_to_upload)}")
+
+    if not files_to_upload:
+        logger.info("No files to upload!")
+        state.status = 'completed'
+        state.end_time = datetime.datetime.now().isoformat()
+        state.save(state_file)
+        return 0
+
+    # Determine if we should show progress bars
+    show_progress = TQDM_AVAILABLE and not args.no_progress
+
+    # Calculate size of files to upload
+    upload_size = sum(f.stat().st_size for f in files_to_upload)
+
+    # Progress tracking
+    uploaded_bytes = 0
+    uploaded_count = 0
+    error_count = 0
+    lock = threading.Lock()
+
+    def upload_with_progress(file_path: Path) -> FileRecord:
+        """Upload a file and track progress."""
+        nonlocal uploaded_bytes, uploaded_count, error_count
+
+        # Calculate S3 key
+        rel_path = file_path.relative_to(args.source)
+        if args.prefix:
+            s3_key = f"{args.prefix.rstrip('/')}/{rel_path.as_posix()}"
+        else:
+            s3_key = rel_path.as_posix()
+
+        record = upload_file(
+            local_path=file_path,
+            bucket=args.bucket,
+            s3_key=s3_key,
+            storage_class=args.storage_class,
+            dry_run=args.dry_run,
+            calculate_checksum=args.checksum
+        )
+
+        with lock:
+            state.files[str(file_path)] = asdict(record)
+
+            if record.status in ('uploaded', 'dry_run'):
+                uploaded_bytes += record.size
+                uploaded_count += 1
+                state.uploaded_files += 1
+                state.uploaded_bytes += record.size
+            else:
+                error_count += 1
+                state.error_files += 1
+
+            # Save state periodically
+            state.save(state_file)
+
+        return record
+
+    # Setup progress bar
+    if show_progress:
+        pbar = tqdm(
+            total=upload_size,
+            unit='B',
+            unit_scale=True,
+            desc="Uploading"
+        )
+    else:
+        pbar = None
+
+    logger.info("=" * 60)
+    logger.info("Starting uploads...")
+    logger.info("=" * 60)
+
+    # Upload files in parallel
+    with ThreadPoolExecutor(max_workers=args.workers) as executor:
+        futures = {
+            executor.submit(upload_with_progress, f): f
+            for f in files_to_upload
+        }
+
+        for future in as_completed(futures):
+            file_path = futures[future]
+            try:
+                record = future.result()
+
+                if pbar:
+                    pbar.update(record.size)
+
+                if record.status in ('uploaded', 'dry_run'):
+                    logger.info(f"OK {file_path.name} -> s3://{args.bucket}/{record.s3_key} ({get_size_str(record.size)})")
+                else:
+                    logger.error(f"ERROR {file_path.name}: {record.error_message}")
+
+            except Exception as e:
+                logger.error(f"Exception uploading {file_path}: {e}")
+                error_count += 1
+
+    if pbar:
+        pbar.close()
+
+    # Final summary
+    state.end_time = datetime.datetime.now().isoformat()
+    if error_count > 0:
+        state.status = 'completed_with_errors'
+    else:
+        state.status = 'completed'
+    state.save(state_file)
+
+    logger.info("=" * 60)
+    logger.info("Backup Summary")
+    logger.info("=" * 60)
+    logger.info(f"Total files: {state.total_files}")
+    logger.info(f"Uploaded: {state.uploaded_files}")
+    logger.info(f"Skipped (already uploaded): {state.skipped_files}")
+    logger.info(f"Errors: {state.error_files}")
+    logger.info(f"Total size: {get_size_str(state.total_bytes)}")
+    logger.info(f"Uploaded size: {get_size_str(state.uploaded_bytes)}")
+    logger.info(f"Storage class: {args.storage_class}")
+    logger.info(f"Destination: s3://{args.bucket}/{args.prefix}")
+    logger.info("")
+    logger.info(f"Log file: {log_file}")
+    logger.info(f"State file: {state_file}")
+
+    if state.error_files > 0:
+        logger.warning(f"Completed with {state.error_files} errors")
+        logger.info("Run with --resume to retry failed uploads")
+        return 1
+
+    logger.info("Backup completed successfully!")
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main(sys.argv[1:]))

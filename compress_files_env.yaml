@@ -7,3 +7,4 @@ dependencies:
   - pigz
   - rsync
   - tqdm
+  - awscli  # For S3 backup tool
