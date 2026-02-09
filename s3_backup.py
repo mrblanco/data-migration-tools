@@ -348,9 +348,11 @@ Examples:
     log_dir = args.log_dir or Path.cwd()
     log_dir.mkdir(parents=True, exist_ok=True)
 
+    # Use source directory name for unique log/state files (handles parallel jobs)
+    source_name = args.source.name  # basename of source directory
     timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-    log_file = log_dir / f's3_backup_{timestamp}.log'
-    state_file = log_dir / 's3_backup_state.json'
+    log_file = log_dir / f's3_backup_{source_name}_{timestamp}.log'
+    state_file = log_dir / f's3_backup_state_{source_name}.json'
 
     logger = setup_logging(log_file)
 
