@@ -276,7 +276,7 @@ def check_bucket_access(bucket: str) -> bool:
     """Check if we have access to the S3 bucket."""
     try:
         result = subprocess.run(
-            ['aws', 's3', 'ls', f's3://{bucket}', '--max-items', '1'],
+            ['aws', 's3', 'ls', f's3://{bucket}/'],
             capture_output=True,
             text=True,
             timeout=30
