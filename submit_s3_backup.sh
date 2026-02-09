@@ -13,84 +13,95 @@ conda activate compress_files
 
 # --- Configuration ---
 # These can be overridden by environment variables
-SOURCE_DIR="${SOURCE_DIR:-/groups/guttman/projects/chip-dip/2021_Histone-ABCAM_Merge}"
 BUCKET="${BUCKET:-guttmanlab-primarydata}"
 PREFIX="${PREFIX:-}"  # Optional: prefix/folder in bucket
 STORAGE_CLASS="${STORAGE_CLASS:-DEEP_ARCHIVE}"
 WORKERS="${WORKERS:-4}"
 EXCLUDE="${EXCLUDE:-.snakemake/}"
 
-# File containing source directories for job arrays (one per line)
+# File containing source directories (one per line)
+# Lines starting with # are comments, empty lines are ignored
 SOURCES_FILE="${SOURCES_FILE:-s3_sources.txt}"
 
-# --- Determine what to backup ---
-# If running as array job and sources file exists, use that
-# Otherwise, use SOURCE_DIR directly
+# --- Read directories from file ---
+if [ ! -f "$SOURCES_FILE" ]; then
+    echo "Error: Sources file not found: $SOURCES_FILE"
+    echo "Create a file with one source directory per line, or set SOURCES_FILE env variable"
+    exit 1
+fi
 
-if [ -n "$SLURM_ARRAY_TASK_ID" ] && [ -f "$SOURCES_FILE" ]; then
-    # Job array mode: read directory from file
-    mapfile -t SOURCES < <(grep -v '^\s*#' "$SOURCES_FILE" | grep -v '^\s*$')
+# Read non-empty, non-comment lines into array
+mapfile -t SOURCES < <(grep -v '^\s*#' "$SOURCES_FILE" | grep -v '^\s*$')
 
-    if [ ${#SOURCES[@]} -eq 0 ]; then
-        echo "Error: No directories found in $SOURCES_FILE"
-        exit 1
-    fi
+if [ ${#SOURCES[@]} -eq 0 ]; then
+    echo "Error: No directories found in $SOURCES_FILE"
+    exit 1
+fi
 
-    IDX=$((SLURM_ARRAY_TASK_ID - 1))
+echo "Loaded ${#SOURCES[@]} directories from $SOURCES_FILE"
+
+# --- Job Array Logic ---
+# If running as array job, use SLURM_ARRAY_TASK_ID to select source
+# If running as single job, process all sources sequentially
+if [ -n "$SLURM_ARRAY_TASK_ID" ]; then
+    # Job array mode: process one directory per task
+    IDX=$((SLURM_ARRAY_TASK_ID - 1))  # Arrays are 1-indexed by default
     if [ $IDX -ge ${#SOURCES[@]} ]; then
         echo "Error: Array index $IDX exceeds number of sources (${#SOURCES[@]})"
         exit 1
     fi
-
-    SOURCE_DIR="${SOURCES[$IDX]}"
-    echo "Job array task $SLURM_ARRAY_TASK_ID processing: $SOURCE_DIR"
-fi
-
-# Extract folder name for prefix if not specified
-FOLDER_NAME=$(basename "$SOURCE_DIR")
-if [ -z "$PREFIX" ]; then
-    S3_PREFIX="$FOLDER_NAME"
+    SOURCES_TO_PROCESS=("${SOURCES[$IDX]}")
+    echo "Job array task $SLURM_ARRAY_TASK_ID processing: ${SOURCES[$IDX]}"
 else
-    S3_PREFIX="$PREFIX/$FOLDER_NAME"
+    # Single job mode: process all sources
+    SOURCES_TO_PROCESS=("${SOURCES[@]}")
+    echo "Single job mode: processing ${#SOURCES[@]} source(s)"
 fi
-
-echo "========================================"
-echo "S3 Backup Job"
-echo "========================================"
-echo "Source: $SOURCE_DIR"
-echo "Bucket: $BUCKET"
-echo "S3 Prefix: $S3_PREFIX"
-echo "Storage Class: $STORAGE_CLASS"
-echo "Workers: $WORKERS"
-echo "Exclude: $EXCLUDE"
-echo "========================================"
 
 # Create logs directory if it doesn't exist
 mkdir -p logs
 
-# Run the backup
-python ./s3_backup.py \
-    --source "$SOURCE_DIR" \
-    --bucket "$BUCKET" \
-    --prefix "$S3_PREFIX" \
-    --storage-class "$STORAGE_CLASS" \
-    --workers "$WORKERS" \
-    --exclude "$EXCLUDE" \
-    --log-dir ./logs \
-    --no-progress \
-    --resume
+# --- Process each source ---
+for source in "${SOURCES_TO_PROCESS[@]}"; do
+    FOLDER_NAME=$(basename "$source")
+    if [ -z "$PREFIX" ]; then
+        S3_PREFIX="$FOLDER_NAME"
+    else
+        S3_PREFIX="$PREFIX/$FOLDER_NAME"
+    fi
 
-EXIT_CODE=$?
+    echo "========================================"
+    echo "S3 Backup Job"
+    echo "========================================"
+    echo "Source: $source"
+    echo "Bucket: $BUCKET"
+    echo "S3 Prefix: $S3_PREFIX"
+    echo "Storage Class: $STORAGE_CLASS"
+    echo "Workers: $WORKERS"
+    echo "Exclude: $EXCLUDE"
+    echo "========================================"
 
-if [ $EXIT_CODE -ne 0 ]; then
-    echo "Warning: s3_backup.py exited with code $EXIT_CODE"
-    echo "Check logs for details. Run with --resume to retry failed uploads."
-else
-    echo "Backup completed successfully!"
-fi
+    # Run the backup
+    python ./s3_backup.py \
+        --source "$source" \
+        --bucket "$BUCKET" \
+        --prefix "$S3_PREFIX" \
+        --storage-class "$STORAGE_CLASS" \
+        --workers "$WORKERS" \
+        --exclude "$EXCLUDE" \
+        --log-dir ./logs \
+        --no-progress \
+        --resume
+
+    if [ $? -ne 0 ]; then
+        echo "Warning: s3_backup.py exited with errors for $source"
+        echo "Check logs for details. Run with --resume to retry failed uploads."
+    else
+        echo "Backup completed successfully for: $FOLDER_NAME"
+    fi
+done
 
 echo "========================================"
+echo "All backups complete."
 echo "Job finished at $(date)"
 echo "========================================"
-
-exit $EXIT_CODE
