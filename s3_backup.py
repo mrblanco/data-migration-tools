@@ -378,6 +378,9 @@ Examples:
 
   # Resume with S3 check (recommended for DEEP_ARCHIVE after state file issues)
   python s3_backup.py --source /data/project --bucket my-bucket --check-existing --resume
+
+  # Check what would be uploaded without uploading (safe for DEEP_ARCHIVE verification)
+  python s3_backup.py --source /data/project --bucket my-bucket --check-only
         """
     )
 
@@ -406,8 +409,14 @@ Examples:
                         help='Show what would be uploaded without actually uploading')
     parser.add_argument('--check-existing', action='store_true',
                         help='Query S3 for existing objects and skip them (recommended for DEEP_ARCHIVE to avoid early deletion penalties)')
+    parser.add_argument('--check-only', action='store_true',
+                        help='Query S3 and report what would be uploaded, then exit (no uploads). Use this to verify before resuming DEEP_ARCHIVE backups.')
 
     args = parser.parse_args(argv)
+
+    # --check-only implies --check-existing
+    if args.check_only:
+        args.check_existing = True
 
     # Validate source
     if not args.source.exists():
@@ -555,11 +564,49 @@ Examples:
         state.save(state_file)
         return 0
 
+    # Calculate size of files to upload (needed for --check-only report)
+    upload_size = sum(f.stat().st_size for f in files_to_upload)
+
+    # --check-only: report what would be uploaded and exit
+    if args.check_only:
+        logger.info("")
+        logger.info("=" * 60)
+        logger.info("CHECK-ONLY MODE - No uploads will be performed")
+        logger.info("=" * 60)
+        logger.info(f"Source: {args.source}")
+        logger.info(f"Destination: s3://{args.bucket}/{args.prefix}")
+        logger.info(f"Storage class: {args.storage_class}")
+        logger.info("")
+        logger.info("Summary:")
+        logger.info(f"  Total files in source: {len(all_files)}")
+        logger.info(f"  Total size in source: {get_size_str(total_size)}")
+        logger.info(f"  Already in S3: {skipped_from_s3}")
+        logger.info(f"  In state file: {skipped_from_state}")
+        logger.info(f"  Files to upload: {len(files_to_upload)}")
+        logger.info(f"  Size to upload: {get_size_str(upload_size)}")
+        logger.info("")
+
+        if files_to_upload:
+            logger.info("Files that would be uploaded:")
+            # Show first 20 files, then summarize
+            for i, f in enumerate(files_to_upload[:20]):
+                rel_path = f.relative_to(args.source)
+                size = f.stat().st_size
+                logger.info(f"  {rel_path} ({get_size_str(size)})")
+            if len(files_to_upload) > 20:
+                logger.info(f"  ... and {len(files_to_upload) - 20} more files")
+
+        logger.info("")
+        logger.info("To proceed with upload, run without --check-only:")
+        logger.info(f"  python s3_backup.py --source {args.source} --bucket {args.bucket} --prefix {args.prefix} --check-existing --resume")
+        logger.info("=" * 60)
+
+        # Save state with pre-existing files marked (so they're skipped on actual run)
+        state.save(state_file)
+        return 0
+
     # Determine if we should show progress bars
     show_progress = TQDM_AVAILABLE and not args.no_progress
-
-    # Calculate size of files to upload
-    upload_size = sum(f.stat().st_size for f in files_to_upload)
 
     # Progress tracking
     uploaded_bytes = 0
