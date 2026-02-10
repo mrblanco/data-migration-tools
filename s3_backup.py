@@ -6,6 +6,7 @@ Features:
 - Parallel uploads using concurrent threads
 - Resumable transfers via JSON state file
 - Support for S3 storage classes (DEEP_ARCHIVE, GLACIER, etc.)
+- Check existing S3 objects to avoid re-uploads (critical for DEEP_ARCHIVE)
 - Extensive logging with progress tracking
 - Dry-run mode for previewing uploads
 
@@ -13,6 +14,7 @@ Usage:
     python s3_backup.py --source /path/to/data --bucket my-bucket --prefix backup/data
     python s3_backup.py --source /path/to/data --bucket my-bucket --storage-class DEEP_ARCHIVE
     python s3_backup.py --source /path/to/data --bucket my-bucket --resume  # Resume interrupted upload
+    python s3_backup.py --source /path/to/data --bucket my-bucket --check-existing  # Skip files already in S3
 """
 
 import argparse
@@ -286,6 +288,73 @@ def check_bucket_access(bucket: str) -> bool:
         return False
 
 
+def list_existing_s3_objects(
+    bucket: str,
+    prefix: str,
+    logger: logging.Logger
+) -> Dict[str, int]:
+    """
+    List all existing objects in S3 under the given prefix.
+
+    Returns a dict mapping S3 keys to their sizes.
+    This is used to check what's already uploaded and avoid re-uploading
+    (important for DEEP_ARCHIVE to avoid early deletion penalties).
+    """
+    existing = {}
+    continuation_token = None
+
+    logger.info(f"Querying S3 for existing objects in s3://{bucket}/{prefix}...")
+
+    while True:
+        cmd = [
+            'aws', 's3api', 'list-objects-v2',
+            '--bucket', bucket,
+            '--prefix', prefix,
+            '--output', 'json'
+        ]
+
+        if continuation_token:
+            cmd.extend(['--continuation-token', continuation_token])
+
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=300  # 5 minute timeout for large listings
+            )
+
+            if result.returncode != 0:
+                logger.warning(f"Failed to list S3 objects: {result.stderr}")
+                break
+
+            data = json.loads(result.stdout)
+
+            for obj in data.get('Contents', []):
+                key = obj['Key']
+                size = obj['Size']
+                existing[key] = size
+
+            # Check if there are more results
+            if data.get('IsTruncated'):
+                continuation_token = data.get('NextContinuationToken')
+            else:
+                break
+
+        except subprocess.TimeoutExpired:
+            logger.warning("Timeout while listing S3 objects")
+            break
+        except json.JSONDecodeError as e:
+            logger.warning(f"Failed to parse S3 listing: {e}")
+            break
+        except Exception as e:
+            logger.warning(f"Error listing S3 objects: {e}")
+            break
+
+    logger.info(f"Found {len(existing)} existing objects in S3")
+    return existing
+
+
 def main(argv: List[str] = None) -> int:
     parser = argparse.ArgumentParser(
         description='Upload directories to AWS S3 with parallel processing and resume capability.',
@@ -306,6 +375,9 @@ Examples:
 
   # Parallel upload with 8 workers
   python s3_backup.py --source /data/project --bucket my-bucket --workers 8
+
+  # Resume with S3 check (recommended for DEEP_ARCHIVE after state file issues)
+  python s3_backup.py --source /data/project --bucket my-bucket --check-existing --resume
         """
     )
 
@@ -332,6 +404,8 @@ Examples:
                         help='Disable progress bars')
     parser.add_argument('--dry-run', action='store_true',
                         help='Show what would be uploaded without actually uploading')
+    parser.add_argument('--check-existing', action='store_true',
+                        help='Query S3 for existing objects and skip them (recommended for DEEP_ARCHIVE to avoid early deletion penalties)')
 
     args = parser.parse_args(argv)
 
@@ -416,16 +490,61 @@ Examples:
     state.total_files = len(all_files)
     state.total_bytes = total_size
 
-    # Filter out already uploaded files if resuming
-    files_to_upload = []
-    for f in all_files:
-        if state.is_uploaded(str(f)):
-            state.skipped_files += 1
-        else:
-            files_to_upload.append(f)
+    # Check S3 for existing objects if requested
+    # This is important for DEEP_ARCHIVE to avoid early deletion penalties
+    existing_s3_objects = {}
+    if args.check_existing and not args.dry_run:
+        existing_s3_objects = list_existing_s3_objects(
+            bucket=args.bucket,
+            prefix=args.prefix,
+            logger=logger
+        )
 
-    if state.skipped_files > 0:
-        logger.info(f"Skipping {state.skipped_files} already uploaded files")
+    # Filter out already uploaded files
+    files_to_upload = []
+    skipped_from_state = 0
+    skipped_from_s3 = 0
+
+    for f in all_files:
+        # Check state file first (faster)
+        if state.is_uploaded(str(f)):
+            skipped_from_state += 1
+            state.skipped_files += 1
+            continue
+
+        # Check S3 if --check-existing was used
+        if existing_s3_objects:
+            rel_path = f.relative_to(args.source)
+            if args.prefix:
+                s3_key = f"{args.prefix.rstrip('/')}/{rel_path.as_posix()}"
+            else:
+                s3_key = rel_path.as_posix()
+
+            if s3_key in existing_s3_objects:
+                # File exists in S3 - check size matches
+                local_size = f.stat().st_size
+                s3_size = existing_s3_objects[s3_key]
+                if local_size == s3_size:
+                    skipped_from_s3 += 1
+                    state.skipped_files += 1
+                    # Update state to mark as uploaded (for future runs)
+                    state.files[str(f)] = {
+                        'local_path': str(f),
+                        's3_key': s3_key,
+                        'size': local_size,
+                        'status': 'uploaded',
+                        'upload_time': 'pre-existing'
+                    }
+                    continue
+                else:
+                    logger.warning(f"Size mismatch for {s3_key}: local={local_size}, S3={s3_size}")
+
+        files_to_upload.append(f)
+
+    if skipped_from_state > 0:
+        logger.info(f"Skipping {skipped_from_state} files (from state file)")
+    if skipped_from_s3 > 0:
+        logger.info(f"Skipping {skipped_from_s3} files (already in S3)")
 
     logger.info(f"Files to upload: {len(files_to_upload)}")
 
