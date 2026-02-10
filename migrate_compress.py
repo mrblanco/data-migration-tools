@@ -934,9 +934,11 @@ Examples:
     log_dir = args.log_dir or args.dest
     log_dir.mkdir(parents=True, exist_ok=True)
 
+    # Use source directory name for unique log/state files (handles parallel jobs)
+    source_name = args.source.name  # basename of source directory
     timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-    log_file = log_dir / f'migration_{timestamp}.log'
-    json_log_file = log_dir / 'migration_state.json'
+    log_file = log_dir / f'migration_{source_name}_{timestamp}.log'
+    json_log_file = log_dir / f'migration_state_{source_name}.json'
 
     logger = setup_logging(log_file)
     logger.info(f"Migration started: {args.source} -> {args.dest}")
