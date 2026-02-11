@@ -256,6 +256,10 @@ def upload_file(
         str(local_path),
         s3_uri,
         '--storage-class', storage_class,
+        # AWS CLI socket timeouts (in seconds)
+        # These prevent "RequestTimeout" errors during large uploads
+        '--cli-read-timeout', '600',     # 10 min - read data from socket
+        '--cli-connect-timeout', '60',   # 1 min - initial connection
     ]
 
     # Configure AWS CLI for better performance via environment variables
