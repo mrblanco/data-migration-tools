@@ -258,6 +258,15 @@ def upload_file(
         '--storage-class', storage_class,
     ]
 
+    # Configure AWS CLI for better performance via environment variables
+    # These settings increase multipart upload efficiency for large files
+    upload_env = os.environ.copy()
+    upload_env.update({
+        'AWS_MAX_CONCURRENT_REQUESTS': '20',  # Default is 10
+        'AWS_MULTIPART_THRESHOLD': '64MB',    # Default is 8MB
+        'AWS_MULTIPART_CHUNKSIZE': '64MB',    # Default is 8MB - larger = fewer API calls
+    })
+
     # Calculate timeout: use override, or dynamic based on file size
     if timeout_override == 0:
         timeout = None  # No timeout
@@ -274,7 +283,8 @@ def upload_file(
             cmd,
             capture_output=True,
             text=True,
-            timeout=timeout
+            timeout=timeout,
+            env=upload_env
         )
 
         if result.returncode == 0:
