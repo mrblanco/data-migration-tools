@@ -198,23 +198,46 @@ def get_files_to_upload(
     return files
 
 
+def calculate_timeout(file_size_bytes: int, base_timeout: int = 1800, per_gb_timeout: int = 360) -> int:
+    """
+    Calculate dynamic timeout based on file size.
+
+    Default: 30 min base + 6 min per GB
+    - 1GB file: 36 min
+    - 10GB file: 90 min
+    - 50GB file: 5.5 hours
+    - 100GB file: 10.5 hours
+
+    Returns timeout in seconds.
+    """
+    gb_size = file_size_bytes / (1024 ** 3)
+    return int(base_timeout + (gb_size * per_gb_timeout))
+
+
 def upload_file(
     local_path: Path,
     bucket: str,
     s3_key: str,
     storage_class: str,
     dry_run: bool = False,
-    calculate_checksum: bool = False
+    calculate_checksum: bool = False,
+    timeout_override: Optional[int] = None
 ) -> FileRecord:
     """
     Upload a single file to S3.
 
+    Args:
+        timeout_override: If provided, use this timeout in seconds.
+                         If 0, disable timeout entirely.
+                         If None, calculate dynamic timeout based on file size.
+
     Returns FileRecord with upload status.
     """
+    file_size = local_path.stat().st_size
     record = FileRecord(
         local_path=str(local_path),
         s3_key=s3_key,
-        size=local_path.stat().st_size
+        size=file_size
     )
 
     if calculate_checksum:
@@ -235,12 +258,23 @@ def upload_file(
         '--storage-class', storage_class,
     ]
 
+    # Calculate timeout: use override, or dynamic based on file size
+    if timeout_override == 0:
+        timeout = None  # No timeout
+        timeout_str = "no timeout"
+    elif timeout_override is not None:
+        timeout = timeout_override
+        timeout_str = f"{timeout // 3600}h {(timeout % 3600) // 60}m"
+    else:
+        timeout = calculate_timeout(file_size)
+        timeout_str = f"{timeout // 3600}h {(timeout % 3600) // 60}m"
+
     try:
         result = subprocess.run(
             cmd,
             capture_output=True,
             text=True,
-            timeout=3600  # 1 hour timeout per file
+            timeout=timeout
         )
 
         if result.returncode == 0:
@@ -252,7 +286,7 @@ def upload_file(
 
     except subprocess.TimeoutExpired:
         record.status = 'error'
-        record.error_message = 'Upload timed out after 1 hour'
+        record.error_message = f'Upload timed out after {timeout_str} (file size: {get_size_str(file_size)})'
     except Exception as e:
         record.status = 'error'
         record.error_message = str(e)
@@ -411,6 +445,8 @@ Examples:
                         help='Query S3 for existing objects and skip them (recommended for DEEP_ARCHIVE to avoid early deletion penalties)')
     parser.add_argument('--check-only', action='store_true',
                         help='Query S3 and report what would be uploaded, then exit (no uploads). Use this to verify before resuming DEEP_ARCHIVE backups.')
+    parser.add_argument('--timeout', type=int, default=None,
+                        help='Upload timeout in seconds per file. Default: dynamic (30min + 6min/GB). Use 0 to disable timeout.')
 
     args = parser.parse_args(argv)
 
@@ -631,7 +667,8 @@ Examples:
             s3_key=s3_key,
             storage_class=args.storage_class,
             dry_run=args.dry_run,
-            calculate_checksum=args.checksum
+            calculate_checksum=args.checksum,
+            timeout_override=args.timeout
         )
 
         with lock:
